@@ -12,9 +12,6 @@ local.properties
 app/build/
 app/release/
 
-# ===== Go =====
-go.sum
-
 # ===== Native Libraries (compiled) =====
 *.so
 *.dll
@@ -31,6 +28,7 @@ server
 *.jks
 *.key
 *.pem
+.env
 
 # ===== IDE =====
 .idea/

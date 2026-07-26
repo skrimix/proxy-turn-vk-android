@@ -199,6 +199,33 @@ qwdtt://config?name=Дом&peer=1.2.3.4:56000&hashes=хеш1,хеш2&workers=18&
 
 Пароли: главный + до 10 пользовательских (срок, привязка к устройству). Обновление без рестарта: правка JSON → `kill -HUP $(pidof wdtt-server)`.
 
+### Docker Compose
+
+Docker-вариант запускает сервер в отдельном bridge network namespace. Интерфейс
+`wdtt0`, IP forwarding и правила NAT создаются внутри контейнера, а не напрямую
+в сетевом namespace VPS. Docker по-прежнему создаёт свои обычные bridge/NAT
+правила для опубликованных портов.
+
+Требования: Linux VPS, Docker Compose и доступный `/dev/net/tun`.
+
+```bash
+cp .env.example .env
+chmod 600 .env
+# Задайте надёжный WDTT_PASSWORD в .env
+docker compose up -d --build
+docker compose logs -f server
+```
+
+Остановить сервер:
+
+```bash
+docker compose down
+```
+
+Конфигурация, база паролей и WireGuard-ключи хранятся в именованном Docker
+volume `wdtt-data` и сохраняются после `docker compose down`. Для полного
+удаления данных volume нужно удалить отдельно.
+
 ---
 
 ## Сборка
