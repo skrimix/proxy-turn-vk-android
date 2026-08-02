@@ -206,7 +206,9 @@ Docker-вариант запускает сервер в отдельном brid
 в сетевом namespace VPS. Docker по-прежнему создаёт свои обычные bridge/NAT
 правила для опубликованных портов.
 
-Требования: Linux VPS, Docker Compose и доступный `/dev/net/tun`.
+Требования: x86-64 Linux VPS, Docker Compose и доступный `/dev/net/tun`.
+При сборке Docker скачивает APK из релиза, проверяет SHA-256 и извлекает из него
+актуальный `assets/server`; локальный `server.go` не используется.
 
 ```bash
 cp .env.example .env
@@ -225,6 +227,10 @@ docker compose down
 Конфигурация, база паролей и WireGuard-ключи хранятся в именованном Docker
 volume `wdtt-data` и сохраняются после `docker compose down`. Для полного
 удаления данных volume нужно удалить отдельно.
+
+По умолчанию публикуются `56000/tcp+udp` (DTLS/API), `56001/udp` (WireGuard) и
+`56003/udp` (Raw). Порты и дополнительные аргументы сервера настраиваются в
+`.env`; список переменных и текущая версия APK приведены в `.env.example`.
 
 ---
 

@@ -2,9 +2,13 @@ name: wdtt
 
 services:
   server:
+    platform: linux/amd64
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        APK_URL: "${WDTT_APK_URL:-https://github.com/SpaceNeuroX/proxy-turn-vk-android/releases/download/v1.4.0-beta/app-arm64-v8a-release.apk}"
+        APK_SHA256: "${WDTT_APK_SHA256:-fe8feffbb982007b7beed47f5581aee3b1e9b0a7133cd33339458c8e63625f5f}"
     image: wdtt-server:local
     restart: unless-stopped
     cap_add:
@@ -14,10 +18,17 @@ services:
     sysctls:
       net.ipv4.ip_forward: "1"
     ports:
-      - "${WDTT_PUBLIC_PORT:-56000}:56000/udp"
-      - "${WDTT_PUBLIC_PORT:-56000}:56000/tcp"
+      - "${WDTT_DTLS_PORT:-56000}:${WDTT_DTLS_PORT:-56000}/udp"
+      - "${WDTT_DTLS_PORT:-56000}:${WDTT_DTLS_PORT:-56000}/tcp"
+      - "${WDTT_WG_PORT:-56001}:${WDTT_WG_PORT:-56001}/udp"
+      - "${WDTT_RAW_PORT:-56003}:${WDTT_RAW_PORT:-56003}/udp"
     environment:
       WDTT_PASSWORD: "${WDTT_PASSWORD:?Set WDTT_PASSWORD in .env}"
+      WDTT_DTLS_PORT: "${WDTT_DTLS_PORT:-56000}"
+      WDTT_WG_PORT: "${WDTT_WG_PORT:-56001}"
+      WDTT_RAW_PORT: "${WDTT_RAW_PORT:-56003}"
+      WDTT_DIRECT_PORT: "${WDTT_DIRECT_PORT:-}"
+      WDTT_ARGS: "${WDTT_ARGS:-}"
       WDTT_DNS: "${WDTT_DNS:-1.1.1.1,1.0.0.1}"
       WDTT_ADMIN_ID: "${WDTT_ADMIN_ID:-}"
       WDTT_BOT_TOKEN: "${WDTT_BOT_TOKEN:-}"
