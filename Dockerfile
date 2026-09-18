@@ -30,7 +30,7 @@ COPY --chmod=0755 docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 
 RUN mkdir -p /etc/wdtt
 
-EXPOSE 56000/tcp 56000/udp
+EXPOSE 56000/tcp 56000/udp 56003/udp
 
 STOPSIGNAL SIGTERM
 
