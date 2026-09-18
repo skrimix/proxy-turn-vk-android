@@ -68,7 +68,7 @@ import com.wdtt.client.ui.SupportNoticeDialog
 import com.wdtt.client.ui.ProfilesTab
 import com.wdtt.client.ui.LogsTab
 import com.wdtt.client.ui.SettingsTab
-import com.wdtt.client.ui.DeployTab
+import com.wdtt.client.ui.ServersTab
 import com.wdtt.client.ui.ExceptionsTab
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
@@ -132,8 +132,6 @@ class MainActivity : ComponentActivity() {
         // URI файла .qwdtt, ожидающего импорта
         val pendingFileUri = mutableStateOf<Uri?>(null)
 
-        // Открыть экран создания профиля из ярлыка лаунчера
-        val pendingAddProfile = mutableStateOf(false)
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -144,9 +142,8 @@ class MainActivity : ComponentActivity() {
 
     private fun handleIncomingIntent(intent: Intent?) {
         when (intent?.action) {
-            AppShortcuts.ACTION_ADD_PROFILE -> {
-                pendingAddProfile.value = true
-            }
+            AppShortcuts.ACTION_START_TUNNEL -> startTunnelFromShortcut()
+            AppShortcuts.ACTION_STOP_TUNNEL -> TunnelControl.stop(applicationContext)
             Intent.ACTION_VIEW -> {
                 val uri = intent.data
                 if (uri != null) {
@@ -154,6 +151,11 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
+    }
+
+    private fun startTunnelFromShortcut() {
+        if (TunnelManager.running.value || TunnelManager.isConnecting.value) return
+        prepareVpnThen { TunnelControl.startFromSavedSettings(applicationContext) }
     }
 
     override fun onStart() {
@@ -260,7 +262,7 @@ private data class NavItem(
 
 private val navItems = listOf(
     NavItem(0, "Туннель", Icons.Filled.VpnKey, Icons.Outlined.VpnKey),
-    NavItem(1, "Деплой", Icons.Filled.Cloud, Icons.Outlined.Cloud),
+    NavItem(1, "Серверы", Icons.Filled.Cloud, Icons.Outlined.Cloud),
     NavItem(2, "Профили", Icons.Filled.FolderOpen, Icons.Outlined.Folder),
     NavItem(3, "Обход", Icons.Filled.FilterList, Icons.Outlined.FilterList),
     NavItem(4, "Логи", Icons.Filled.Terminal, Icons.Outlined.Terminal),
@@ -335,15 +337,7 @@ fun MainScreen(
         }
     }
 
-    val pendingAddProfile = MainActivity.pendingAddProfile.value
     var requestCreateProfile by remember { mutableStateOf(false) }
-    LaunchedEffect(pendingAddProfile) {
-        if (pendingAddProfile) {
-            selectedTab = 2
-            requestCreateProfile = true
-            MainActivity.pendingAddProfile.value = false
-        }
-    }
 
     LaunchedEffect(Unit) {
         val supportShownFor = settingsStore.supportNoticeShownVersionCode.first()
@@ -439,7 +433,6 @@ fun MainScreen(
             )
 
             if (hasUpdate && !isPostponed) {
-                settingsStore.saveUpdateDialogShown(release.versionTag, checkedAt)
                 pendingRelease = release
             }
         }
@@ -530,7 +523,7 @@ fun MainScreen(
                             onConnectRequested = { pendingSwitchToLogs = true },
                             onOpenProfiles = { selectedTab = 2 },
                         )
-                        1 -> DeployTab()
+                        1 -> ServersTab()
                         2 -> ProfilesTab(
                             onProfileApplied = { selectedTab = 0 },
                             importFileUri = MainActivity.pendingFileUri.value,
@@ -683,21 +676,11 @@ fun MainScreen(
                         version = release.versionTag,
                         until = now + 24L * 60L * 60L * 1000L
                     )
-                    settingsStore.saveUpdateDialogAction(
-                        version = release.versionTag,
-                        action = UPDATE_DIALOG_ACTION_POSTPONED,
-                        actedAt = now
-                    )
                 }
             },
             onUpdate = {
                 pendingRelease = null
                 scope.launch {
-                    settingsStore.saveUpdateDialogAction(
-                        version = release.versionTag,
-                        action = UPDATE_DIALOG_ACTION_UPDATE,
-                        actedAt = System.currentTimeMillis()
-                    )
                     openReleaseUrl(context, release.releaseUrl)
                 }
             }
@@ -739,9 +722,9 @@ private fun ProxyNavigationBar(
         colors.outline.copy(alpha = 0.16f)
     }
     val indicatorColor = if (isDark) {
-        colors.primaryContainer.copy(alpha = 0.84f)
+        colors.primary.copy(alpha = 0.18f)
     } else {
-        lerp(colors.primaryContainer, colors.surface, 0.18f).copy(alpha = 0.97f)
+        lerp(colors.primaryContainer, colors.surface, 0.18f).copy(alpha = 0.94f)
     }
     val indicatorIndex = remember { Animatable(0f) }
     val selectedVisualIndex = navItems.indexOfFirst { it.id == selectedTab }.coerceAtLeast(0)
@@ -790,11 +773,11 @@ private fun ProxyNavigationBar(
                     .height(72.dp)
             ) {
                 Surface(
-                    shape = RoundedCornerShape(22.dp),
+                    shape = RoundedCornerShape(20.dp),
                     color = indicatorColor,
                     modifier = Modifier
                         .offset { androidx.compose.ui.unit.IntOffset(x = indicatorOffset.roundToPx(), y = 0) }
-                        .padding(vertical = 6.dp)
+                        .padding(vertical = 8.dp)
                         .width(itemWidth)
                         .fillMaxHeight()
                 ) {}
@@ -819,7 +802,8 @@ private fun ProxyNavigationBar(
                         ) {
                             Box(contentAlignment = Alignment.TopEnd) {
                                 Icon(
-                                    imageVector = if (emphasis > 0.55f) item.selectedIcon else item.unselectedIcon,
+                                    // Плоские outlined-иконки; активная вкладка — через цветной контейнер.
+                                    imageVector = item.unselectedIcon,
                                     contentDescription = item.label,
                                     modifier = Modifier.size(22.dp),
                                     tint = iconColor
@@ -905,22 +889,22 @@ private fun AppBackdrop(modifier: Modifier = Modifier) {
             }
         )
     }
-    val topGlow = colors.primary.copy(alpha = if (isDark) 0.055f else 0.09f)
+    val topGlow = colors.primary.copy(alpha = if (isDark) 0.04f else 0.065f)
     val leftGlow = if (isDark) {
-        colors.tertiary.copy(alpha = 0.045f)
+        colors.tertiary.copy(alpha = 0.03f)
     } else {
-        lerp(colors.tertiary, colors.secondaryContainer, 0.74f).copy(alpha = 0.24f)
+        lerp(colors.tertiary, colors.secondaryContainer, 0.74f).copy(alpha = 0.16f)
     }
     val bottomGlow = if (isDark) {
-        colors.primary.copy(alpha = 0.04f)
+        colors.primary.copy(alpha = 0.028f)
     } else {
-        lerp(colors.secondary, colors.primaryContainer, 0.70f).copy(alpha = 0.22f)
+        lerp(colors.secondary, colors.primaryContainer, 0.70f).copy(alpha = 0.14f)
     }
-    val lightOrbOutline = colors.outlineVariant.copy(alpha = 0.26f)
+    val lightOrbOutline = colors.outlineVariant.copy(alpha = 0.18f)
     val topOrbGlow = if (isDark) {
         topGlow
     } else {
-        lerp(colors.primary, colors.primaryContainer, 0.72f).copy(alpha = 0.32f)
+        lerp(colors.primary, colors.primaryContainer, 0.72f).copy(alpha = 0.22f)
     }
 
     Box(

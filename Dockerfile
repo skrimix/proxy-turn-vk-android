@@ -10,9 +10,9 @@ WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 
-COPY server.go ./
+COPY server/ ./server/
 RUN CGO_ENABLED=0 GOOS="$TARGETOS" GOARCH="$TARGETARCH" \
-    go build -trimpath -ldflags="-s -w" -o /out/wdtt-server .
+    go build -trimpath -ldflags="-s -w" -o /out/wdtt-server ./server
 
 FROM debian:bookworm-slim
 

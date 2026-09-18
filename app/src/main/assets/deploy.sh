@@ -8,13 +8,20 @@
 #  DTLS: порт 56000
 # ==============================================================================
 set -uo pipefail
+trap 'rm -f /tmp/wdtt-admin.token /tmp/wdtt-main.password /tmp/wdtt-bot.token' EXIT
 
 readonly SCRIPT_VERSION="3.2"
 readonly LOG_FILE="/var/log/wdtt-install.log"
 readonly WG_PORT="${WDTT_WG_PORT:-56001}"
 readonly DTLS_PORT="${WDTT_DTLS_PORT:-56000}"
 readonly SSH_PORT="${WDTT_SSH_PORT:-22}"
-readonly WDTT_ARGS="${WDTT_ARGS:-}"
+readonly ADMIN_PORT="${WDTT_ADMIN_PORT:-56002}"
+# Пусто = выключено. Экспериментальный порт для клиентов без DTLS (RTP-obfs AEAD напрямую).
+readonly DIRECT_PORT="${WDTT_DIRECT_PORT:-}"
+# Пусто = выключено. Экспериментальный порт для raw-IP клиентов без WireGuard (свой TUN/NAT).
+readonly RAW_PORT="${WDTT_RAW_PORT:-}"
+readonly ADMIN_ID="${WDTT_ADMIN_ID:-}"
+readonly DNS_SERVERS="${WDTT_DNS_SERVERS:-1.1.1.1,1.0.0.1}"
 readonly WDTT_IFACE="wdtt0"
 readonly WDTT_CONFIG_DIR="/etc/wdtt"
 readonly WDTT_ACCESS_DB="passwords.json"
@@ -29,6 +36,33 @@ validate_port() {
     if [ "$value" -lt 1 ] || [ "$value" -gt 65535 ]; then
         die "$name должен быть в диапазоне 1..65535, получено: $value"
     fi
+}
+
+validate_admin_id() {
+    case "$ADMIN_ID" in
+        ''|*[!0-9]*) [ -z "$ADMIN_ID" ] || die "WDTT_ADMIN_ID должен содержать только цифры" ;;
+    esac
+}
+
+validate_dns_servers() {
+    local old_ifs="$IFS" item octet
+    IFS=','
+    for item in $DNS_SERVERS; do
+        case "$item" in
+            ''|*[!0-9.]*) IFS="$old_ifs"; die "DNS должен быть IPv4-адресом: $item" ;;
+        esac
+        IFS='.' read -r o1 o2 o3 o4 extra <<< "$item"
+        [ -n "${o1:-}" ] && [ -n "${o2:-}" ] && [ -n "${o3:-}" ] && [ -n "${o4:-}" ] && [ -z "${extra:-}" ] || {
+            IFS="$old_ifs"; die "Некорректный DNS IPv4: $item"
+        }
+        for octet in "$o1" "$o2" "$o3" "$o4"; do
+            [ "$octet" -ge 0 ] 2>/dev/null && [ "$octet" -le 255 ] 2>/dev/null || {
+                IFS="$old_ifs"; die "Некорректный DNS IPv4: $item"
+            }
+        done
+        IFS=','
+    done
+    IFS="$old_ifs"
 }
 
 # ─── Цвета ───────────────────────────────────────────────────────────────────
@@ -110,15 +144,15 @@ install_prerequisites() {
 
     case "$PKG_MGR" in
         apt)
-            pkg_install ca-certificates iproute2 iptables nftables procps psmisc || \
+            pkg_install ca-certificates openssl iproute2 iptables nftables procps psmisc || \
                 log_warn "Часть apt-пакетов не установилась, продолжаю с доступными утилитами"
             ;;
         dnf|yum)
-            pkg_install ca-certificates iproute iptables nftables procps-ng psmisc || \
+            pkg_install ca-certificates openssl iproute iptables nftables procps-ng psmisc || \
                 log_warn "Часть rpm-пакетов не установилась, продолжаю с доступными утилитами"
             ;;
         pacman)
-            pkg_install ca-certificates iproute2 iptables nftables procps-ng psmisc || \
+            pkg_install ca-certificates openssl iproute2 iptables nftables procps-ng psmisc || \
                 log_warn "Часть pacman-пакетов не установилась, продолжаю с доступными утилитами"
             ;;
     esac
@@ -220,6 +254,15 @@ fw_add_input_udp() {
     esac
 }
 
+fw_restrict_wg_to_loopback() {
+    [ "$FW_BACKEND" = "iptables" ] || return 0
+    iptables -D INPUT -p udp --dport "$WG_PORT" -m comment --comment "$IPT_COMMENT" -j ACCEPT 2>/dev/null || true
+    iptables -C INPUT -i lo -p udp --dport "$WG_PORT" -m comment --comment WDTT_WG_INTERNAL -j ACCEPT 2>/dev/null || \
+        iptables -I INPUT -i lo -p udp --dport "$WG_PORT" -m comment --comment WDTT_WG_INTERNAL -j ACCEPT
+    iptables -C INPUT ! -i lo -p udp --dport "$WG_PORT" -m comment --comment WDTT_WG_INTERNAL -j DROP 2>/dev/null || \
+        iptables -I INPUT ! -i lo -p udp --dport "$WG_PORT" -m comment --comment WDTT_WG_INTERNAL -j DROP
+}
+
 fw_add_input_tcp() {
     local port="$1"
     case "$FW_BACKEND" in
@@ -313,6 +356,8 @@ fw_cleanup_wdtt_rules() {
             iptables -D INPUT -p udp --dport ${DTLS_PORT} -m comment --comment "$IPT_COMMENT" -j ACCEPT 2>/dev/null || true
             iptables -D INPUT -p tcp --dport ${DTLS_PORT} -m comment --comment "$IPT_COMMENT" -j ACCEPT 2>/dev/null || true
             iptables -D INPUT -p udp --dport ${WG_PORT} -m comment --comment "$IPT_COMMENT" -j ACCEPT 2>/dev/null || true
+            iptables -D INPUT -i lo -p udp --dport ${WG_PORT} -m comment --comment WDTT_WG_INTERNAL -j ACCEPT 2>/dev/null || true
+            iptables -D INPUT ! -i lo -p udp --dport ${WG_PORT} -m comment --comment WDTT_WG_INTERNAL -j DROP 2>/dev/null || true
             iptables -D INPUT -p tcp --dport ${SSH_PORT} -m comment --comment "$IPT_COMMENT" -j ACCEPT 2>/dev/null || true
             iptables -D INPUT -p tcp --dport 22 -m comment --comment "$IPT_COMMENT" -j ACCEPT 2>/dev/null || true
             iptables -D FORWARD -i "$WDTT_IFACE" -m comment --comment "$IPT_COMMENT" -j ACCEPT 2>/dev/null || true
@@ -395,8 +440,15 @@ setup_nat_and_firewall() {
     # === WDTT порты ===
     fw_add_input_udp "$DTLS_PORT"   # 56000 — DTLS сервер
     fw_add_input_tcp "$DTLS_PORT"   # 56000 — API (TCP)
-    fw_add_input_udp "$WG_PORT"     # 56001 — WireGuard
+    fw_restrict_wg_to_loopback
+    fw_add_input_tcp "$ADMIN_PORT"
     fw_add_input_tcp "$SSH_PORT"    # SSH порт, указанный пользователем в приложении
+    if [ -n "$DIRECT_PORT" ]; then
+        fw_add_input_udp "$DIRECT_PORT"   # -listen-direct: клиенты без DTLS
+    fi
+    if [ -n "$RAW_PORT" ]; then
+        fw_add_input_udp "$RAW_PORT"   # -listen-raw: raw-IP клиенты без WireGuard
+    fi
 
     # === Forward ===
     fw_add_forward
@@ -435,10 +487,64 @@ setup_wdtt_binary() {
     mkdir -p "$WDTT_CONFIG_DIR"
 }
 
+setup_admin_tls() {
+    [ -s /tmp/wdtt-admin.token ] || die "Токен защищённой админ-панели не загружен"
+    cp /tmp/wdtt-admin.token "$WDTT_CONFIG_DIR/admin.token"
+    chmod 0600 "$WDTT_CONFIG_DIR/admin.token"
+    rm -f /tmp/wdtt-admin.token
+    if [ ! -s "$WDTT_CONFIG_DIR/admin.crt" ] || [ ! -s "$WDTT_CONFIG_DIR/admin.key" ]; then
+        openssl req -x509 -newkey rsa:2048 -sha256 -nodes -days 3650 \
+            -keyout "$WDTT_CONFIG_DIR/admin.key" \
+            -out "$WDTT_CONFIG_DIR/admin.crt" \
+            -subj "/CN=qwdtt-admin" >/dev/null 2>&1 || die "Не удалось создать TLS-сертификат"
+    fi
+    chmod 0600 "$WDTT_CONFIG_DIR/admin.key" "$WDTT_CONFIG_DIR/admin.crt"
+    local pin
+    pin=$(openssl x509 -in "$WDTT_CONFIG_DIR/admin.crt" -outform DER | openssl dgst -sha256 -binary | openssl base64 -A)
+    [ -n "$pin" ] || die "Не удалось получить отпечаток TLS-сертификата"
+    echo "WDTT_ADMIN_PIN|sha256/$pin"
+}
+
+setup_server_secrets() {
+    [ -s /tmp/wdtt-main.password ] || die "Пароль владельца не загружен"
+    install -m 0600 /tmp/wdtt-main.password "$WDTT_CONFIG_DIR/main.password"
+    rm -f /tmp/wdtt-main.password
+    if [ -s /tmp/wdtt-bot.token ]; then
+        install -m 0600 /tmp/wdtt-bot.token "$WDTT_CONFIG_DIR/bot.token"
+    else
+        rm -f "$WDTT_CONFIG_DIR/bot.token"
+    fi
+    rm -f /tmp/wdtt-bot.token
+}
+
 # ─── Systemd-сервис WDTT ─────────────────────────────────────────────────────
 setup_wdtt_service() {
     prog 0.75 "Сервис..."
     echo "🔧 Создание systemd-сервиса WDTT..."
+
+    local direct_exec_arg=""
+    local direct_fw_rule=""
+    if [ -n "$DIRECT_PORT" ]; then
+        direct_exec_arg="-listen-direct 0.0.0.0:${DIRECT_PORT}"
+        direct_fw_rule="iptables -C INPUT -p udp --dport ${DIRECT_PORT} -m comment --comment ${IPT_COMMENT} -j ACCEPT 2>/dev/null || iptables -I INPUT -p udp --dport ${DIRECT_PORT} -m comment --comment ${IPT_COMMENT} -j ACCEPT; "
+    fi
+
+    local raw_exec_arg=""
+    local raw_fw_rule=""
+    if [ -n "$RAW_PORT" ]; then
+        raw_exec_arg="-listen-raw 0.0.0.0:${RAW_PORT}"
+        raw_fw_rule="iptables -C INPUT -p udp --dport ${RAW_PORT} -m comment --comment ${IPT_COMMENT} -j ACCEPT 2>/dev/null || iptables -I INPUT -p udp --dport ${RAW_PORT} -m comment --comment ${IPT_COMMENT} -j ACCEPT; "
+    fi
+
+    local bot_exec_arg=""
+    if [ -s "$WDTT_CONFIG_DIR/bot.token" ]; then
+        bot_exec_arg="-bot-token-file ${WDTT_CONFIG_DIR}/bot.token"
+    fi
+
+    local admin_exec_arg=""
+    if [ -n "$ADMIN_ID" ]; then
+        admin_exec_arg="-admin ${ADMIN_ID}"
+    fi
 
     cat > /etc/systemd/system/wdtt.service << WDTTSVC
 [Unit]
@@ -449,11 +555,12 @@ Wants=network-online.target
 [Service]
 Type=simple
 ExecStartPre=-/usr/bin/env bash -c "ip link show ${WDTT_IFACE} >/dev/null 2>&1 && ip link del ${WDTT_IFACE} 2>/dev/null || true"
-ExecStartPre=-/usr/bin/env bash -c "if command -v iptables >/dev/null 2>&1; then iptables -C INPUT -p udp --dport ${DTLS_PORT} -m comment --comment ${IPT_COMMENT} -j ACCEPT 2>/dev/null || iptables -I INPUT -p udp --dport ${DTLS_PORT} -m comment --comment ${IPT_COMMENT} -j ACCEPT; iptables -C INPUT -p tcp --dport ${DTLS_PORT} -m comment --comment ${IPT_COMMENT} -j ACCEPT 2>/dev/null || iptables -I INPUT -p tcp --dport ${DTLS_PORT} -m comment --comment ${IPT_COMMENT} -j ACCEPT; iptables -C INPUT -p udp --dport ${WG_PORT} -m comment --comment ${IPT_COMMENT} -j ACCEPT 2>/dev/null || iptables -I INPUT -p udp --dport ${WG_PORT} -m comment --comment ${IPT_COMMENT} -j ACCEPT; iptables -C INPUT -p tcp --dport ${SSH_PORT} -m comment --comment ${IPT_COMMENT} -j ACCEPT 2>/dev/null || iptables -I INPUT -p tcp --dport ${SSH_PORT} -m comment --comment ${IPT_COMMENT} -j ACCEPT; fi"
-ExecStart=/usr/local/bin/wdtt-server -listen 0.0.0.0:${DTLS_PORT} -wg-port ${WG_PORT} -config-dir ${WDTT_CONFIG_DIR} ${WDTT_ARGS}
+ExecStartPre=-/usr/bin/env bash -c "if command -v iptables >/dev/null 2>&1; then iptables -C INPUT -p udp --dport ${DTLS_PORT} -m comment --comment ${IPT_COMMENT} -j ACCEPT 2>/dev/null || iptables -I INPUT -p udp --dport ${DTLS_PORT} -m comment --comment ${IPT_COMMENT} -j ACCEPT; iptables -C INPUT -p tcp --dport ${DTLS_PORT} -m comment --comment ${IPT_COMMENT} -j ACCEPT 2>/dev/null || iptables -I INPUT -p tcp --dport ${DTLS_PORT} -m comment --comment ${IPT_COMMENT} -j ACCEPT; iptables -C INPUT -i lo -p udp --dport ${WG_PORT} -m comment --comment WDTT_WG_INTERNAL -j ACCEPT 2>/dev/null || iptables -I INPUT -i lo -p udp --dport ${WG_PORT} -m comment --comment WDTT_WG_INTERNAL -j ACCEPT; iptables -C INPUT ! -i lo -p udp --dport ${WG_PORT} -m comment --comment WDTT_WG_INTERNAL -j DROP 2>/dev/null || iptables -I INPUT ! -i lo -p udp --dport ${WG_PORT} -m comment --comment WDTT_WG_INTERNAL -j DROP; iptables -C INPUT -p tcp --dport ${ADMIN_PORT} -m comment --comment ${IPT_COMMENT} -j ACCEPT 2>/dev/null || iptables -I INPUT -p tcp --dport ${ADMIN_PORT} -m comment --comment ${IPT_COMMENT} -j ACCEPT; iptables -C INPUT -p tcp --dport ${SSH_PORT} -m comment --comment ${IPT_COMMENT} -j ACCEPT 2>/dev/null || iptables -I INPUT -p tcp --dport ${SSH_PORT} -m comment --comment ${IPT_COMMENT} -j ACCEPT; ${direct_fw_rule}${raw_fw_rule}fi"
+ExecStart=/usr/local/bin/wdtt-server -listen 0.0.0.0:${DTLS_PORT} -wg-port ${WG_PORT} -config-dir ${WDTT_CONFIG_DIR} -password-file ${WDTT_CONFIG_DIR}/main.password ${admin_exec_arg} ${bot_exec_arg} -dns ${DNS_SERVERS} -admin-listen 0.0.0.0:${ADMIN_PORT} -admin-token-file ${WDTT_CONFIG_DIR}/admin.token -admin-cert ${WDTT_CONFIG_DIR}/admin.crt -admin-key ${WDTT_CONFIG_DIR}/admin.key ${direct_exec_arg} ${raw_exec_arg}
 Restart=always
 RestartSec=5
 LimitNOFILE=65535
+UMask=0077
 
 [Install]
 WantedBy=multi-user.target
@@ -488,6 +595,7 @@ start_wdtt() {
 
     if [ "$status" = "active" ]; then
         echo "✅ Деплой успешно завершён!"
+        echo "WDTT_DEPLOY_OK"
         echo "   NAT:  MASQUERADE (стандартный)"
         echo "   DTLS: порт ${DTLS_PORT}"
         echo "   WG:   порт ${WG_PORT}"
@@ -496,6 +604,7 @@ start_wdtt() {
         echo "⚠️ Сервис wdtt не запустился. Статус: $status"
         echo "   Последние логи:"
         journalctl -u wdtt -n 7 --no-pager 2>/dev/null | sed 's/^/   >> /'
+        echo "WDTT_DEPLOY_SERVICE_FAILED"
     fi
 
     echo "   Логи:   journalctl -u wdtt -f"
@@ -561,6 +670,11 @@ main() {
     validate_port "WDTT_DTLS_PORT" "$DTLS_PORT"
     validate_port "WDTT_WG_PORT" "$WG_PORT"
     validate_port "WDTT_SSH_PORT" "$SSH_PORT"
+    validate_port "WDTT_ADMIN_PORT" "$ADMIN_PORT"
+    [ -n "$DIRECT_PORT" ] && validate_port "WDTT_DIRECT_PORT" "$DIRECT_PORT"
+    [ -n "$RAW_PORT" ] && validate_port "WDTT_RAW_PORT" "$RAW_PORT"
+    validate_admin_id
+    validate_dns_servers
 
     mkdir -p "$(dirname "$LOG_FILE")"
     echo "=== WDTT Installer v${SCRIPT_VERSION} — $(date) ===" >> "$LOG_FILE"
@@ -578,6 +692,8 @@ main() {
             setup_sysctl
             setup_nat_and_firewall
             setup_wdtt_binary
+            setup_admin_tls
+            setup_server_secrets
             setup_wdtt_service
             start_wdtt
             ;;

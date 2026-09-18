@@ -165,7 +165,7 @@ func main() {
 	listen := flag.String("listen", "127.0.0.1:9000", "локальный адрес")
 	vkHash := flag.String("vk", "", "хеши VK-звонков (через запятую)")
 	peerAddr := flag.String("peer", "", "адрес:порт VPS сервера")
-	numW := flag.Int("n", 24, "количество воркеров (кратно 12)")
+	numW := flag.Int("n", 9, "количество воркеров")
 	pingOnly := flag.Bool("ping-only", false, "запустить только замер задержки и выйти")
 
 	deviceID := flag.String("device-id", "unknown", "уникальный ID устройства")
@@ -177,13 +177,27 @@ func main() {
 	goDNS := flag.String("go-dns", "yandex", "DNS для VK (yandex/cloudflare/google, doh-yandex/doh-cloudflare/doh-google, custom:IP или doh:URL)")
 	obfsMode := flag.String("obfs", "audio", "режим обфускации (audio/video)")
 	checkHashes := flag.Bool("check-hashes", false, "проверить VK-хеши и выйти")
-	connMode := flag.String("mode", "vpn", "режим клиента (vpn|socks)")
+	connMode := flag.String("mode", "vpn", "режим клиента (vpn|socks|rawtun)")
 	socksAddr := flag.String("socks", "127.0.0.1:1080", "локальный SOCKS5 (только -mode socks)")
+	socksAuth := flag.Bool("socks-auth", false, "требовать логин и пароль SOCKS5")
+	socksUser := flag.String("socks-user", "", "логин SOCKS5")
+	socksPass := flag.String("socks-pass", "", "пароль SOCKS5")
+	noDTLS := flag.Bool("notls", false, "прямой режим: RTP-obfs AEAD без DTLS поверх TURN (нужен сервер с -listen-direct)")
+	turnTCP := flag.Bool("turn-tcp", false, "соединяться с TURN-relay по TCP вместо UDP (обход UDP-душения на некоторых сетях, напр. Ростелеком)")
+	tunFdSock := flag.String("tun-fd-sock", "", "unix-сокет для получения TUN fd от Android (только -mode rawtun)")
 
 	flag.Parse()
 	activeConnMode := strings.ToLower(strings.TrimSpace(*connMode))
-	if activeConnMode != "socks" {
+	if activeConnMode != "socks" && activeConnMode != "rawtun" {
 		activeConnMode = "vpn"
+	}
+	if activeConnMode == "socks" && *socksAuth {
+		if *socksUser == "" || *socksPass == "" {
+			log.Fatal("[SOCKS] Для авторизации нужны логин и пароль")
+		}
+		if len([]byte(*socksUser)) > 255 || len([]byte(*socksPass)) > 255 {
+			log.Fatal("[SOCKS] Логин и пароль должны быть не длиннее 255 байт")
+		}
 	}
 	setupGlobalResolver(*goDNS)
 	activeCaptchaMode := setCaptchaMode(*captchaMode)
@@ -258,11 +272,14 @@ func main() {
 	}
 
 	tp := &TurnParams{
-		Host:     *host,
-		Port:     *port,
-		Hashes:   hashes,
-		WrapKey:  wrapKey,
-		ObfsMode: normalizeObfsMode(*obfsMode),
+		Host:         *host,
+		Port:         *port,
+		Hashes:       hashes,
+		WrapKey:      wrapKey,
+		ObfsMode:     normalizeObfsMode(*obfsMode),
+		NoDTLS:       *noDTLS,
+		RawMode:      activeConnMode == "rawtun",
+		TCPTransport: *turnTCP,
 	}
 
 	if *pingOnly {
@@ -325,10 +342,17 @@ func main() {
 	log.Printf("[КЛИЕНТ] Воркеров: %d (групп: %d, по %d)", *numW, numGroups, workersPerGroup)
 	log.Printf("[КЛИЕНТ] Хешей: %d", len(hashes))
 	log.Printf("[КЛИЕНТ] Слушаю: %s | Пир: %s", *listen, *peerAddr)
-	log.Printf("[КЛИЕНТ] Протокол: UDP")
+	if *turnTCP {
+		log.Printf("[КЛИЕНТ] TURN-транспорт: TCP")
+	} else {
+		log.Printf("[КЛИЕНТ] TURN-транспорт: UDP")
+	}
 	log.Printf("[КЛИЕНТ] Режим: %s", activeConnMode)
 	if activeConnMode == "socks" {
 		log.Printf("[КЛИЕНТ] SOCKS5: %s", *socksAddr)
+		if *socksAuth {
+			log.Printf("[КЛИЕНТ] SOCKS5: авторизация по логину и паролю включена")
+		}
 	}
 	log.Printf("[КЛИЕНТ] WRAP: %s", wrapStatus)
 	log.Printf("[WRAP] Ключ выведен из пароля, режим RTP AEAD активен")
@@ -344,7 +368,12 @@ func main() {
 	}()
 	go stats.RunLoop(shutdownCh)
 
-	disp := NewDispatcher(ctx, localConn, stats)
+	var disp *Dispatcher
+	if activeConnMode == "rawtun" {
+		disp = NewDispatcherPendingTUN(ctx, stats)
+	} else {
+		disp = NewDispatcher(ctx, localConn, stats)
+	}
 	defer disp.Shutdown()
 
 	configCh := make(chan string, 1)
@@ -356,6 +385,50 @@ func main() {
 			if !ok || rawConf == "" {
 				return
 			}
+
+			if strings.HasPrefix(rawConf, "RAWCONF:") {
+				parts := strings.Split(strings.TrimPrefix(rawConf, "RAWCONF:"), "|")
+				if len(parts) != 3 {
+					log.Printf("[RAW] Некорректный RAWCONF: %q", rawConf)
+					return
+				}
+				ip, dnsCSV, mtuStr := parts[0], parts[1], parts[2]
+				fmt.Println()
+				fmt.Println("╔══════════════ RAW Конфиг ══════════════╗")
+				fmt.Printf("║ %-40s ║\n", fmt.Sprintf("IP = %s", ip))
+				fmt.Printf("║ %-40s ║\n", fmt.Sprintf("DNS = %s", dnsCSV))
+				fmt.Printf("║ %-40s ║\n", fmt.Sprintf("MTU = %s", mtuStr))
+				fmt.Println("╚══════════════════════════════════════╝")
+
+				if *tunFdSock == "" {
+					log.Println("[RAW] Ошибка: -tun-fd-sock не указан")
+					return
+				}
+
+				log.Println("[RAW] Ожидание TUN fd от Android...")
+				var tunFile *os.File
+				var fdErr error
+				attempt := 0
+				for {
+					attempt++
+					tunFile, fdErr = recvTunFD(*tunFdSock)
+					if fdErr == nil {
+						break
+					}
+					rawDiagf("recvTunFD попытка #%d неудачна: %v (повтор через 200мс)", attempt, fdErr)
+					select {
+					case <-ctx.Done():
+						rawDiagf("recvTunFD: ctx отменён, прекращаю попытки")
+						return
+					case <-time.After(200 * time.Millisecond):
+					}
+				}
+				rawDiagf("recvTunFD успешен на попытке #%d, fd=%v", attempt, tunFile.Fd())
+				disp.AttachTUN(tunFile)
+				log.Println("[RAW] TUN подключён, трафик пошёл")
+				return
+			}
+
 			finalConf := rawConf
 			if !strings.Contains(finalConf, "MTU =") {
 				lines := strings.Split(finalConf, "\n")
@@ -387,7 +460,7 @@ func main() {
 					return
 				}
 				defer dev.Close()
-				if err := runSocks5Server(ctx, *socksAddr, tnet); err != nil {
+				if err := runSocks5Server(ctx, *socksAddr, tnet, *socksAuth, *socksUser, *socksPass); err != nil {
 					log.Printf("[SOCKS] Сервер остановлен: %v", err)
 				}
 			}
